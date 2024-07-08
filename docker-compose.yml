@@ -1,0 +1,276 @@
+version: "3"
+
+x-common-environment: &common-environment
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: password
+  AWS_REGION: us-east-1
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v23.3.18
+    container_name: redpanda
+    networks:
+      iceberg_net:
+    ports:
+      - "9092:9092"
+      - "8081:8081"
+      - "8082:8082"
+      - "29092:29092"
+    volumes:
+      - ./rpk/connect/:/home/redpanda/connect
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --check=false
+      
+  connect:
+    image: confluentinc/cp-kafka-connect-base:7.3.0
+    depends_on:
+      - redpanda
+    hostname: connect
+    container_name: connect
+    networks:
+      iceberg_net:
+    ports:
+      - 8083:8083
+    environment:
+      <<: *common-environment    
+      CONNECT_BOOTSTRAP_SERVERS: 'redpanda:29092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: "connect"
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: connect-cluster-group
+      CONNECT_CONFIG_STORAGE_TOPIC: _kafka-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _kafka-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _kafka-connect-status
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.StringConverter"
+      CONNECT_INTERNAL_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_LOG4J_ROOT_LOGLEVEL: "INFO"
+      CONNECT_LOG4J_LOGGERS: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_PLUGIN_PATH: '/usr/share/java,/usr/share/confluent-hub-components/,/connectors/'
+    command: 
+      - bash 
+      - -c 
+      - |
+        #
+        echo "Installing connector plugins"
+        confluent-hub install --no-prompt tabular/iceberg-kafka-connect:0.4.11
+        #
+        echo "Launching Kafka Connect worker"
+        /etc/confluent/docker/run & 
+        #
+        echo "Waiting for Kafka Connect to start listening on localhost ⏳"
+        while : ; do
+          curl_status=$$(curl -s -o /dev/null -w %{http_code} http://localhost:8083/connectors)
+          echo -e $$(date) " Kafka Connect listener HTTP state: " $$curl_status " (waiting for 200)"
+          if [ $$curl_status -eq 200 ] ; then
+            break
+          fi
+          sleep 5 
+        done
+        echo -e "\n--\n+> Creating connector"
+        curl -X PUT \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' http://localhost:8083/connectors/IcebergSinkConnector/config \
+        -d '{
+          "tasks.max": "1",
+          "topics": "payments",
+          "connector.class": "io.tabular.iceberg.connect.IcebergSinkConnector",
+          "iceberg.catalog.s3.endpoint": "http://minio:9000",
+          "iceberg.catalog.s3.secret-access-key": "password",
+          "iceberg.catalog.s3.access-key-id": "admin",
+          "iceberg.catalog.s3.path-style-access": "true",
+          "iceberg.catalog.uri": "http://rest:8181/",
+          "iceberg.catalog.warehouse": "s3://warehouse/",
+          "iceberg.catalog.client.region": "us-east-1",
+          "iceberg.catalog.type": "rest",
+          "iceberg.control.commitIntervalMs": "1000",
+          "iceberg.tables": "orders.payments",
+          "value.converter.schemas.enable": "false",
+          "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+          "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+          "schemas.enable": "false"
+        }'
+        sleep infinity
+
+  console:
+    image: redpandadata/console:v2.6.0
+    container_name: console
+    networks:
+      iceberg_net:
+    entrypoint: /bin/sh
+    command: -c "echo \"$$CONSOLE_CONFIG_FILE\" > /tmp/config.yml; /app/console"
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:29092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        connect:
+          enabled: true
+          clusters:
+            - name: local-connect-cluster
+              url: http://connect:8083
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - 18080:8080
+    depends_on:
+      - redpanda
+      - connect
+
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    depends_on:
+      - rest
+      - minio
+    volumes:
+      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/test-schema.sql:/home/trino/test-schema.sql
+    environment:
+      <<: *common-environment
+
+  spark-iceberg:
+      image: tabulario/spark-iceberg
+      hostname: spark-iceberg
+      container_name: spark-iceberg
+      networks:
+        iceberg_net:
+      build: spark/
+      depends_on:
+        - rest
+        - minio
+      environment:
+        <<: *common-environment
+        SPARK_DEFAULTS: |
+          spark.sql.extensions                    org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          spark.sql.catalog.iceberg               org.apache.iceberg.spark.SparkCatalog
+          spark.sql.catalog.iceberg.catalog-impl  org.apache.iceberg.rest.RESTCatalog
+          spark.sql.catalog.iceberg.uri           http://rest:8181
+          spark.sql.catalog.iceberg.io-impl       org.apache.iceberg.aws.s3.S3FileIO
+          spark.sql.catalog.iceberg.warehouse     s3://warehouse/wh/
+          spark.sql.catalog.iceberg.s3.endpoint   http://minio:9000
+          spark.sql.catalog.iceberg.s3.path-style-access  true
+          spark.sql.defaultCatalog                iceberg
+          spark.sql.catalogImplementation         in-memory
+          spark.eventLog.enabled                  true
+          spark.eventLog.dir                      /home/iceberg/spark-events
+          spark.history.fs.logDirectory           /home/iceberg/spark-events
+          spark.jars.packages                     org.apache.hadoop:hadoop-aws:3.2.0
+      ports:
+        - 8888:8888
+        - 8080:8080
+        - 10000:10000
+        - 10001:10001
+      volumes:
+        - ./spark:/home/iceberg/scripts
+        - ./notebooks:/home/iceberg/notebooks/notebooks
+      command: ["echo \"$$SPARK_DEFAULTS\" > /opt/spark/conf/spark-defaults.conf && spark-submit /home/iceberg/scripts/create_table.py && notebook"]
+      
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 8181:8181
+    environment:
+      <<: *common-environment
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_URI: jdbc:postgresql://postgres/demo_catalog
+      CATALOG_JDBC_USER: admin
+      CATALOG_JDBC_PASSWORD: password
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: demo_catalog
+      POSTGRES_HOST_AUTH_METHOD: md5
+    networks:
+      iceberg_net:
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d demo_catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    volumes:
+      - minio_data:/data
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      <<: *common-environment
+    entrypoint: >
+      /bin/sh -c "
+          until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+          /usr/bin/mc mb minio/warehouse;
+          /usr/bin/mc policy set public minio/warehouse;
+          tail -f /dev/null
+      "      
+
+networks:
+  iceberg_net:
+
+volumes:
+  postgres_data:
+  minio_data:
